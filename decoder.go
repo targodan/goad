@@ -4,16 +4,17 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/targodan/native"
+
 	"gopkg.in/targodan/ffgopeg.v1/avcodec"
 	"gopkg.in/targodan/ffgopeg.v1/avformat"
 	"gopkg.in/targodan/ffgopeg.v1/avutil"
 )
 
 type Decoder struct {
-	formatCtxt *avformat.Context
+	formatCtxt *avformat.FormatContext
 	streams    []streamInfo
 	read       bool
-	readErrors chan error
 }
 
 type streamInfo struct {
@@ -23,10 +24,9 @@ type streamInfo struct {
 }
 
 func NewDecoder(filename string) (*Decoder, error) {
-	d = &Decoder{
-		readErrors: make(chan error, 1),
-	}
+	d := &Decoder{}
 
+	var code avutil.ReturnCode
 	d.formatCtxt, code = avformat.OpenInput(filename, nil, nil)
 
 	if !code.Ok() {
@@ -44,7 +44,7 @@ func (d *Decoder) EnableFirstAudioStream(bufferSize int) (<-chan []float32, erro
 			return d.EnableStream(i, bufferSize)
 		}
 	}
-	return nil, fmt.ErErrorf("No audio stream found.")
+	return nil, fmt.Errorf("No audio stream found.")
 }
 
 func (d *Decoder) EnableStream(streamIndex int, bufferSize int) (<-chan []float32, error) {
@@ -61,13 +61,12 @@ func (d *Decoder) EnableStream(streamIndex int, bufferSize int) (<-chan []float3
 	if s.codecCtxt == nil {
 		return nil, fmt.Errorf("Could not create codec context for stream nr. %d.", streamIndex)
 	}
-	code := s.codecCtxt.FromParameters(f.formatCtx.Streams()[streamIndex].CodecPar())
+	code := s.codecCtxt.FromParameters(d.formatCtxt.Streams()[streamIndex].CodecPar())
 	if !code.Ok() {
 		return nil, code
 	}
 	d.streams = append(d.streams, s)
-	// s.codecCtxt.SetRequestSampleFmt(s.codecCtxt.SampleFmt().Packed())
-	code = codecCtxt.Open(codec, nil)
+	code = s.codecCtxt.Open(codec, nil)
 	if !code.Ok() {
 		return nil, code
 	}
@@ -78,12 +77,11 @@ func (d *Decoder) Close() {
 	for _, s := range d.streams {
 		s.codecCtxt.Close()
 		s.codecCtxt.Free()
-		close(s.buffer)
 	}
 	d.formatCtxt.Close()
 }
 
-func (d *Decoder) Streams() []avformat.Stream {
+func (d *Decoder) Streams() []*avformat.Stream {
 	return d.formatCtxt.Streams()
 }
 
@@ -102,10 +100,10 @@ func (d *Decoder) findStream(i int) streamInfo {
 			return s
 		}
 	}
-	return nil
+	panic("Stream does not exist.")
 }
 
-func getSample(sampleFmt avcodec.SampleFmt, buffer []byte, sampleIndex int) (float32, error) {
+func getSample(sampleFmt avutil.SampleFormat, buffer []byte, sampleIndex int) float32 {
 	sampleSize := sampleFmt.BytesPerSample()
 	byteIndex := sampleSize * sampleIndex
 	var val int64
@@ -153,19 +151,20 @@ func getSample(sampleFmt avcodec.SampleFmt, buffer []byte, sampleIndex int) (flo
 		break
 
 	default:
-		return 0, fmt.Errorf("Invalid sample format %s.", sampleFmt.Name())
+		panic(fmt.Sprintf("Invalid sample format %s.", sampleFmt.Name()))
 	}
 
-	return ret, nil
+	return ret
 }
 
-func (d *Decoder) Start() {
+func (d *Decoder) Start() <-chan error {
+	readErrors := make(chan error)
 	d.read = true
 	// start the reader
 	go func(d *Decoder) {
 		frame := avutil.NewFrame()
 		if frame == nil {
-			d.readErrors <- fmt.Errorf("Could not allocate frame.")
+			readErrors <- fmt.Errorf("Could not allocate frame.")
 			d.read = false
 			return
 		}
@@ -176,11 +175,11 @@ func (d *Decoder) Start() {
 
 		for d.read {
 			// Read next frame
-			code := formatCtx.ReadFrame(&packet)
+			code := d.formatCtxt.ReadFrame(&packet)
 			if code.IsOneOf(avutil.AVERROR_EOF()) {
 				break
 			} else if !code.Ok() {
-				d.readErrors <- code
+				readErrors <- code
 				d.read = false
 				return
 			}
@@ -190,8 +189,10 @@ func (d *Decoder) Start() {
 				continue
 			}
 
+			stream := d.findStream(packet.StreamIndex())
+
 			for {
-				code = codecCtxt.SendPacket(&packet)
+				code = stream.codecCtxt.SendPacket(&packet)
 				if code.Ok() {
 					packet.Unref()
 					break
@@ -200,16 +201,18 @@ func (d *Decoder) Start() {
 					// TODO: synchronise with consumer
 				} else {
 					// Something went wrong.
-					d.readErrors <- code
+					readErrors <- code
 					d.read = false
 					return
 				}
 			}
 		}
-		code := codecCtxt.SendPacket(nil)
-		if !code.Ok() {
-			d.readErrors <- code
-			d.read = false
+		for _, stream := range d.streams {
+			code := stream.codecCtxt.SendPacket(nil)
+			if !code.Ok() {
+				readErrors <- code
+				d.read = false
+			}
 		}
 	}(d)
 
@@ -218,7 +221,7 @@ func (d *Decoder) Start() {
 		d.read = false
 		frame := avutil.NewFrame()
 		if frame == nil {
-			d.readErrors <- fmt.Errorf("Could not allocate frame.")
+			readErrors <- fmt.Errorf("Could not allocate frame.")
 			d.read = false
 			return
 		}
@@ -231,7 +234,7 @@ func (d *Decoder) Start() {
 					// wait and try again
 					// TODO: synchronise
 				} else if !code.Ok() {
-					d.readErrors <- code
+					readErrors <- code
 					return
 				}
 
@@ -239,9 +242,9 @@ func (d *Decoder) Start() {
 					sample := make([]float32, stream.codecCtxt.Channels())
 					for c := 0; c < stream.codecCtxt.Channels(); c++ {
 						if stream.codecCtxt.SampleFmt().IsPlanar() {
-							sample[c] = getSample(stream.codecCtxt, frame.ExtendedData(c, frame.Linesize(0)), s)
+							sample[c] = getSample(stream.codecCtxt.SampleFmt(), frame.ExtendedData(c, frame.Linesize(0)), s)
 						} else {
-							sample[c] = getSample(stream.codecCtxt, frame.ExtendedData(0, frame.Linesize(0)), s*stream.codecCtxt.Channels()+c)
+							sample[c] = getSample(stream.codecCtxt.SampleFmt(), frame.ExtendedData(0, frame.Linesize(0)), s*stream.codecCtxt.Channels()+c)
 						}
 					}
 					stream.buffer <- sample
@@ -250,5 +253,11 @@ func (d *Decoder) Start() {
 				frame.Unref()
 			}
 		}
+
+		for _, stream := range d.streams {
+			close(stream.buffer)
+		}
 	}(d)
+
+	return readErrors
 }

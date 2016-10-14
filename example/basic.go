@@ -36,18 +36,27 @@ func main() {
 	// Remember to close it afterwards.
 	defer outFile.Close()
 
-	decoder := goad.NewDecoder()
+	decoder, err := goad.NewDecoder(inFilename)
+	if err != nil {
+		panic(err)
+	}
 	defer decoder.Close()
 
 	ch, err := decoder.EnableFirstAudioStream(2048)
 	panicOnErr(err)
 
-	decoder.Start()
+	errCh := decoder.Start()
+
+	go func(errCh <-chan error) {
+		for err := range errCh {
+			panicOnErr(err)
+		}
+	}(errCh)
 
 	bufFile := bufio.NewWriter(outFile)
 	defer bufFile.Flush()
-	for _, samples := range ch {
-		for sample := range samples {
+	for samples := range ch {
+		for _, sample := range samples {
 			binary.Write(bufFile, binary.LittleEndian, sample)
 		}
 	}
