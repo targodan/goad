@@ -1,7 +1,7 @@
 package goad
 
-import "github.com/giorgisio/goav/avformat"
+import "gopkg.in/targodan/ffgopeg.v1/avformat"
 
-func Init() {
-	avformat.AvRegisterAll()
+func init() {
+	avformat.RegisterAll()
 }
