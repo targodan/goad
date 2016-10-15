@@ -3,6 +3,7 @@ package goad
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/targodan/native"
 
@@ -13,14 +14,17 @@ import (
 
 type Decoder struct {
 	formatCtxt *avformat.FormatContext
-	streams    []streamInfo
+	streams    []*streamInfo
 	read       bool
 }
 
 type streamInfo struct {
-	buffer      chan []float32
-	streamIndex int
-	codecCtxt   *avcodec.CodecContext
+	buffer        chan []float32
+	streamIndex   int
+	codecCtxt     *avcodec.CodecContext
+	sendRecvMutex sync.Mutex
+	eagainSend    *eagainSychronizer
+	eagainRecv    *eagainSychronizer
 }
 
 func NewDecoder(filename string) (*Decoder, error) {
@@ -53,10 +57,12 @@ func (d *Decoder) EnableStream(streamIndex int, bufferSize int) (<-chan []float3
 		return nil, fmt.Errorf("Could not find decoder for stream nr. %d.", streamIndex)
 	}
 
-	s := streamInfo{
+	s := &streamInfo{
 		buffer:      make(chan []float32, bufferSize),
 		streamIndex: streamIndex,
 		codecCtxt:   avcodec.NewCodecContext(codec),
+		eagainSend:  newEagainSynchronizer(),
+		eagainRecv:  newEagainSynchronizer(),
 	}
 	if s.codecCtxt == nil {
 		return nil, fmt.Errorf("Could not create codec context for stream nr. %d.", streamIndex)
@@ -94,7 +100,7 @@ func (d *Decoder) isStreamEnabled(i int) bool {
 	return false
 }
 
-func (d *Decoder) findStream(i int) streamInfo {
+func (d *Decoder) findStream(i int) *streamInfo {
 	for _, s := range d.streams {
 		if s.streamIndex == i {
 			return s
@@ -192,13 +198,18 @@ func (d *Decoder) Start() <-chan error {
 			stream := d.findStream(packet.StreamIndex())
 
 			for {
+				stream.sendRecvMutex.Lock()
 				code = stream.codecCtxt.SendPacket(&packet)
+				stream.sendRecvMutex.Unlock()
 				if code.Ok() {
 					packet.Unref()
+					stream.eagainRecv.Signal()
 					break
 				} else if code.IsOneOf(avutil.AVERROR_EAGAIN()) {
 					// wait and try again
 					// TODO: synchronise with consumer
+					stream.eagainRecv.Signal()
+					stream.eagainSend.Wait()
 				} else {
 					// Something went wrong.
 					readErrors <- code
@@ -216,27 +227,37 @@ func (d *Decoder) Start() <-chan error {
 		}
 	}(d)
 
-	// start consumer
-	go func(d *Decoder) {
-		d.read = false
-		frame := avutil.NewFrame()
-		if frame == nil {
-			readErrors <- fmt.Errorf("Could not allocate frame.")
-			d.read = false
-			return
-		}
-		defer frame.Free()
+	var wg sync.WaitGroup
 
-		for d.read {
-			for _, stream := range d.streams {
+	// start consumer
+	for _, stream := range d.streams {
+		wg.Add(1)
+		go func(stream *streamInfo) {
+			frame := avutil.NewFrame()
+			if frame == nil {
+				readErrors <- fmt.Errorf("Could not allocate frame.")
+				d.read = false
+				return
+			}
+			defer frame.Free()
+
+			for d.read {
+				stream.sendRecvMutex.Lock()
 				code := stream.codecCtxt.ReceiveFrame(frame)
+				stream.sendRecvMutex.Unlock()
 				if code.IsOneOf(avutil.AVERROR_EAGAIN()) {
 					// wait and try again
 					// TODO: synchronise
+					stream.eagainSend.Signal()
+					stream.eagainRecv.Wait()
+					continue
+				} else if code.IsOneOf(avutil.AVERROR_EOF()) {
+					break
 				} else if !code.Ok() {
 					readErrors <- code
-					return
+					break
 				}
+				stream.eagainSend.Signal()
 
 				for s := 0; s < frame.NbSamples(); s++ {
 					sample := make([]float32, stream.codecCtxt.Channels())
@@ -252,12 +273,15 @@ func (d *Decoder) Start() <-chan error {
 
 				frame.Unref()
 			}
-		}
-
-		for _, stream := range d.streams {
 			close(stream.buffer)
-		}
-	}(d)
+			wg.Done()
+		}(stream)
+	}
+
+	go func() {
+		wg.Wait()
+		close(readErrors)
+	}()
 
 	return readErrors
 }
