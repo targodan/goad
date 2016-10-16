@@ -42,19 +42,38 @@ func NewDecoder(filename string) (*Decoder, error) {
 	return d, nil
 }
 
-func (d *Decoder) EnableFirstAudioStream(bufferSize int) (<-chan []float32, error) {
+func (d *Decoder) EnableFirstAudioStream(bufferSize int, sampleRate int) (<-chan []float32, error, int) {
 	for i, s := range d.formatCtxt.Streams() {
 		if s.CodecPar().CodecType() == avutil.AVMEDIA_TYPE_AUDIO {
-			return d.EnableStream(i, bufferSize)
+			return d.EnableStream(i, bufferSize, sampleRate)
 		}
 	}
-	return nil, fmt.Errorf("No audio stream found.")
+	return nil, fmt.Errorf("No audio stream found."), 0
 }
 
-func (d *Decoder) EnableStream(streamIndex int, bufferSize int) (<-chan []float32, error) {
+func (d *Decoder) EnableAllAudioStreams(bufferSize int, sampleRate int) ([]<-chan []float32, []error, []int) {
+	var ret []<-chan []float32
+	var errors []error
+	var sampleRates []int
+	for i, s := range d.formatCtxt.Streams() {
+		if s.CodecPar().CodecType() == avutil.AVMEDIA_TYPE_AUDIO {
+			ch, err, sr := d.EnableStream(i, bufferSize, sampleRate)
+			ret = append(ret, ch)
+			errors = append(errors, err)
+			sampleRates = append(sampleRates, sr)
+		}
+	}
+	return ret, errors, sampleRates
+}
+
+func (d *Decoder) EnableStream(streamIndex int, bufferSize int, sampleRate int) (<-chan []float32, error, int) {
+	if d.formatCtxt.Streams()[streamIndex].CodecPar().CodecType() != avutil.AVMEDIA_TYPE_AUDIO {
+		return nil, fmt.Errorf("Stream %d is not an audio stream!", streamIndex), 0
+	}
+
 	codec := avcodec.FindDecoder(d.formatCtxt.Streams()[streamIndex].CodecPar().CodecID())
 	if codec == nil {
-		return nil, fmt.Errorf("Could not find decoder for stream nr. %d.", streamIndex)
+		return nil, fmt.Errorf("Could not find decoder for stream nr. %d.", streamIndex), 0
 	}
 
 	s := &streamInfo{
@@ -65,18 +84,23 @@ func (d *Decoder) EnableStream(streamIndex int, bufferSize int) (<-chan []float3
 		eagainRecv:  newEagainSynchronizer(),
 	}
 	if s.codecCtxt == nil {
-		return nil, fmt.Errorf("Could not create codec context for stream nr. %d.", streamIndex)
+		return nil, fmt.Errorf("Could not create codec context for stream nr. %d.", streamIndex), 0
 	}
+
 	code := s.codecCtxt.FromParameters(d.formatCtxt.Streams()[streamIndex].CodecPar())
 	if !code.Ok() {
-		return nil, code
+		return nil, code, 0
 	}
+
 	d.streams = append(d.streams, s)
+
+	s.codecCtxt.SetSampleRate(sampleRate)
+
 	code = s.codecCtxt.Open(codec, nil)
 	if !code.Ok() {
-		return nil, code
+		return nil, code, 0
 	}
-	return s.buffer, nil
+	return s.buffer, nil, s.codecCtxt.SampleRate()
 }
 
 func (d *Decoder) Close() {
@@ -206,8 +230,6 @@ func (d *Decoder) Start() <-chan error {
 					stream.eagainRecv.Signal()
 					break
 				} else if code.IsOneOf(avutil.AVERROR_EAGAIN()) {
-					// wait and try again
-					// TODO: synchronise with consumer
 					stream.eagainRecv.Signal()
 					stream.eagainSend.Wait()
 				} else {
@@ -246,8 +268,6 @@ func (d *Decoder) Start() <-chan error {
 				code := stream.codecCtxt.ReceiveFrame(frame)
 				stream.sendRecvMutex.Unlock()
 				if code.IsOneOf(avutil.AVERROR_EAGAIN()) {
-					// wait and try again
-					// TODO: synchronise
 					stream.eagainSend.Signal()
 					stream.eagainRecv.Wait()
 					continue
