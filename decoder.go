@@ -133,8 +133,7 @@ func (d *Decoder) findStream(i int) *streamInfo {
 	panic("Stream does not exist.")
 }
 
-func getSample(sampleFmt avutil.SampleFormat, buffer []byte, sampleIndex int) float32 {
-	sampleSize := sampleFmt.BytesPerSample()
+func getSample(sampleFmt avutil.SampleFormat, sampleSize int, buffer []byte, sampleIndex int) float32 {
 	byteIndex := sampleSize * sampleIndex
 	var val int64
 	switch sampleSize {
@@ -263,6 +262,10 @@ func (d *Decoder) Start() <-chan error {
 			}
 			defer frame.Free()
 
+			// Apparently retreiving the sample size and isPlanar takes rather long => do it just once.
+			sampleSize := stream.codecCtxt.SampleFmt().BytesPerSample()
+			isPlanar := stream.codecCtxt.SampleFmt().IsPlanar()
+
 			for d.read {
 				stream.sendRecvMutex.Lock()
 				code := stream.codecCtxt.ReceiveFrame(frame)
@@ -282,10 +285,10 @@ func (d *Decoder) Start() <-chan error {
 				for s := 0; s < frame.NbSamples(); s++ {
 					sample := make([]float32, stream.codecCtxt.Channels())
 					for c := 0; c < stream.codecCtxt.Channels(); c++ {
-						if stream.codecCtxt.SampleFmt().IsPlanar() {
-							sample[c] = getSample(stream.codecCtxt.SampleFmt(), frame.ExtendedData(c, frame.Linesize(0)), s)
+						if isPlanar {
+							sample[c] = getSample(stream.codecCtxt.SampleFmt(), sampleSize, frame.ExtendedData(c, frame.Linesize(0)), s)
 						} else {
-							sample[c] = getSample(stream.codecCtxt.SampleFmt(), frame.ExtendedData(0, frame.Linesize(0)), s*stream.codecCtxt.Channels()+c)
+							sample[c] = getSample(stream.codecCtxt.SampleFmt(), sampleSize, frame.ExtendedData(0, frame.Linesize(0)), s*stream.codecCtxt.Channels()+c)
 						}
 					}
 					stream.buffer <- sample
