@@ -42,7 +42,7 @@ func main() {
 	}
 	defer decoder.Close()
 
-	ch, err := decoder.EnableFirstAudioStream(2048)
+	ch, err, _ := decoder.EnableFirstAudioStream(2048, 44100)
 	panicOnErr(err)
 
 	errCh := decoder.Start()
