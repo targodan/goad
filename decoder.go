@@ -12,6 +12,10 @@ import (
 	"gopkg.in/targodan/ffgopeg.v1/avutil"
 )
 
+// Decoder provides decding funcitonality for an audio file.
+//
+// Before you can start decoding you need to enable at least one
+// audio stream.
 type Decoder struct {
 	formatCtxt *avformat.FormatContext
 	streams    []*streamInfo
@@ -27,6 +31,7 @@ type streamInfo struct {
 	eagainRecv    *eagainSychronizer
 }
 
+// NewDecoder creates a new Decoder for the given file.
 func NewDecoder(filename string) (*Decoder, error) {
 	d := &Decoder{}
 
@@ -42,38 +47,59 @@ func NewDecoder(filename string) (*Decoder, error) {
 	return d, nil
 }
 
-func (d *Decoder) EnableFirstAudioStream(bufferSize int, sampleRate int) (<-chan []float32, error, int) {
+// EnableFirstAudioStream enables the first audio stream in the file.
+// It returns a channel that will provide the sample data of the audio
+// stream. Each slice returned by the channel contains multiple audio
+// samples.
+// The bufferSize is the number of sample-slices buffered in the cahnnel.
+// The second return parameter is the actual sample rate of the stream,
+// it may differ from the requested sampleRate.
+func (d *Decoder) EnableFirstAudioStream(bufferSize int, sampleRate int) (<-chan []float32, int, error) {
 	for i, s := range d.formatCtxt.Streams() {
 		if s.CodecPar().CodecType() == avutil.AVMEDIA_TYPE_AUDIO {
 			return d.EnableStream(i, bufferSize, sampleRate)
 		}
 	}
-	return nil, fmt.Errorf("No audio stream found."), 0
+	return nil, 0, fmt.Errorf("no audio stream found")
 }
 
-func (d *Decoder) EnableAllAudioStreams(bufferSize int, sampleRate int) ([]<-chan []float32, []error, []int) {
+// EnableAllAudioStreams enables all audio streams in the file.
+// It returns a channel that will provide the sample data for each
+// stream. Each slice returned by the channel contains multiple audio
+// samples.
+// The bufferSize is the number of sample-slices buffered in the cahnnel.
+// The second return parameter is the actual sample rate of the stream,
+// it may differ from the requested sampleRate.
+func (d *Decoder) EnableAllAudioStreams(bufferSize int, sampleRate int) ([]<-chan []float32, []int, []error) {
 	var ret []<-chan []float32
 	var errors []error
 	var sampleRates []int
 	for i, s := range d.formatCtxt.Streams() {
 		if s.CodecPar().CodecType() == avutil.AVMEDIA_TYPE_AUDIO {
-			ch, err, sr := d.EnableStream(i, bufferSize, sampleRate)
+			ch, sr, err := d.EnableStream(i, bufferSize, sampleRate)
 			ret = append(ret, ch)
 			errors = append(errors, err)
 			sampleRates = append(sampleRates, sr)
 		}
 	}
-	return ret, errors, sampleRates
+	return ret, sampleRates, errors
 }
 
-func (d *Decoder) EnableStream(streamIndex int, bufferSize int, sampleRate int) (<-chan []float32, error, int) {
+// EnableStream enables the audio stream in the file with the index streamIndex.
+// It returns a channel that will provide the sample data of the audio
+// stream. Each slice returned by the channel contains multiple audio
+// samples.
+// The bufferSize is the number of sample-slices buffered in the cahnnel.
+// The second return parameter is the actual sample rate of the stream,
+// it may differ from the requested sampleRate.
+func (d *Decoder) EnableStream(streamIndex int, bufferSize int, sampleRate int) (<-chan []float32, int, error) {
 	if d.formatCtxt.Streams()[streamIndex].CodecPar().CodecType() != avutil.AVMEDIA_TYPE_AUDIO {
-		return nil, fmt.Errorf("Stream %d is not an audio stream!", streamIndex), 0
+		return nil, 0, fmt.Errorf("stream %d is not an audio stream", streamIndex)
 	}
 
 	codec := avcodec.FindDecoder(d.formatCtxt.Streams()[streamIndex].CodecPar().CodecID())
 	if codec == nil {
-		return nil, fmt.Errorf("Could not find decoder for stream nr. %d.", streamIndex), 0
+		return nil, 0, fmt.Errorf("could not find decoder for stream nr. %d", streamIndex)
 	}
 
 	s := &streamInfo{
@@ -84,12 +110,12 @@ func (d *Decoder) EnableStream(streamIndex int, bufferSize int, sampleRate int) 
 		eagainRecv:  newEagainSynchronizer(),
 	}
 	if s.codecCtxt == nil {
-		return nil, fmt.Errorf("Could not create codec context for stream nr. %d.", streamIndex), 0
+		return nil, 0, fmt.Errorf("could not create codec context for stream nr. %d", streamIndex)
 	}
 
 	code := s.codecCtxt.FromParameters(d.formatCtxt.Streams()[streamIndex].CodecPar())
 	if !code.Ok() {
-		return nil, code, 0
+		return nil, 0, code
 	}
 
 	d.streams = append(d.streams, s)
@@ -98,11 +124,12 @@ func (d *Decoder) EnableStream(streamIndex int, bufferSize int, sampleRate int) 
 
 	code = s.codecCtxt.Open(codec, nil)
 	if !code.Ok() {
-		return nil, code, 0
+		return nil, 0, code
 	}
-	return s.buffer, nil, s.codecCtxt.SampleRate()
+	return s.buffer, s.codecCtxt.SampleRate(), nil
 }
 
+// Close closes the decoders of all streams.
 func (d *Decoder) Close() {
 	for _, s := range d.streams {
 		s.codecCtxt.Close()
@@ -111,6 +138,8 @@ func (d *Decoder) Close() {
 	d.formatCtxt.Close()
 }
 
+// Streams returns a slice of avformat.Stream containing all
+// audio streams in the file as ffmpeg streams.
 func (d *Decoder) Streams() []*avformat.Stream {
 	return d.formatCtxt.Streams()
 }
@@ -130,7 +159,7 @@ func (d *Decoder) findStream(i int) *streamInfo {
 			return s
 		}
 	}
-	panic("Stream does not exist.")
+	panic("stream does not exist")
 }
 
 func getSample(sampleFmt avutil.SampleFormat, sampleSize int, buffer []byte, sampleIndex int) float32 {
@@ -151,7 +180,7 @@ func getSample(sampleFmt avutil.SampleFormat, sampleSize int, buffer []byte, sam
 		val = int64(native.ByteOrder.Uint64(buffer[byteIndex : byteIndex+sampleSize]))
 
 	default:
-		panic(fmt.Sprintf("Invalid sample size %d.", sampleSize))
+		panic(fmt.Sprintf("invalid sample size %d", sampleSize))
 	}
 
 	var ret float32
@@ -180,12 +209,16 @@ func getSample(sampleFmt avutil.SampleFormat, sampleSize int, buffer []byte, sam
 		break
 
 	default:
-		panic(fmt.Sprintf("Invalid sample format %s.", sampleFmt.Name()))
+		panic(fmt.Sprintf("invalid sample format %s", sampleFmt.Name()))
 	}
 
 	return ret
 }
 
+// Start starts the decoding. After this call the channels returned
+// by the Enable*Stream calls will start receiving samples.
+// Start returns a channel that will receive all errors that may come
+// up during decoding.
 func (d *Decoder) Start() <-chan error {
 	readErrors := make(chan error)
 	d.read = true
@@ -193,7 +226,7 @@ func (d *Decoder) Start() <-chan error {
 	go func(d *Decoder) {
 		frame := avutil.NewFrame()
 		if frame == nil {
-			readErrors <- fmt.Errorf("Could not allocate frame.")
+			readErrors <- fmt.Errorf("could not allocate frame")
 			d.read = false
 			return
 		}
@@ -256,7 +289,7 @@ func (d *Decoder) Start() <-chan error {
 		go func(stream *streamInfo) {
 			frame := avutil.NewFrame()
 			if frame == nil {
-				readErrors <- fmt.Errorf("Could not allocate frame.")
+				readErrors <- fmt.Errorf("could not allocate frame")
 				d.read = false
 				return
 			}
